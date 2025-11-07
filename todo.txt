@@ -1,0 +1,23 @@
+# Single image
+python stenosis_centerline_batch.py --in /path/to/frame.png --out out/case1 --px 0.22
+
+# Whole folder (recursive) with 6 workers
+python stenosis_centerline_batch.py `
+  --in "D:\Work\CV\Project\Data" `
+  --out "D:\Work\CV\Project\DOut" `
+  --px 0.22 `
+  --pattern "*.png" `
+  --recursive `
+  --workers 6 `
+  --pds_thresh 50 `
+  --topk 3
+
+
+
+python stenosis_centerline_batch.py --in "D:\Work\CV\Project\Data\14.png" 
+  --out "D:\Work\CV\Project\Out\14" --px 0.22 --mark_deepest
+
+python stenosis_centerline_batch.py --in "D:\Work\CV\Project\Data\14.png" 
+  --out "D:\Work\CV\Project\Out\14" --px 0.22 --mark_index 18
+
+python stenosis_centerline_batch.py --in "D:\Work\CV\Project\Data\14.png" --out "D:\Work\CV\Project\Out\14" --px 0.22 --debug_plot
