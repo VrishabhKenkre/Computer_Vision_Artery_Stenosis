@@ -21,3 +21,4 @@ python stenosis_centerline_batch.py --in "D:\Work\CV\Project\Data\14.png"
   --out "D:\Work\CV\Project\Out\14" --px 0.22 --mark_index 18
 
 python stenosis_centerline_batch.py --in "D:\Work\CV\Project\Data\14.png" --out "D:\Work\CV\Project\Out\14" --px 0.22 --debug_plot
+python stenosis_centerline_batch.py --in "D:\Work\CV\Project\Data\11.png" --out "D:\Work\CV\Project\Out\11" --px 0.22 --debug_plot
