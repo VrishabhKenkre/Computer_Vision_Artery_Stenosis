@@ -33,6 +33,8 @@ from skimage.filters import frangi, threshold_otsu
 from skimage.morphology import (closing, opening, remove_small_holes, remove_small_objects,
                                 disk, dilation)
 from skimage.segmentation import clear_border
+from scipy.ndimage import gaussian_filter1d
+
 
 # ---------------------------
 # Tunable parameters
@@ -54,6 +56,20 @@ MIN_REF_DIAM  = 1.0        # px; ignore minima with tiny reference
 # ---------------------------
 # Core functions
 # ---------------------------
+
+def load_binary_mask(path):
+    m = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+    if m is None:
+        raise RuntimeError(f"Cannot read mask: {path}")
+
+    # Your case: dark lines = vessels, bright = background
+    thr = 0 if m.max() <= 1 else 127
+    mask = (m < thr)   # <-- invert: black = vessel, white = background
+
+    from skimage.morphology import remove_small_objects
+    mask = remove_small_objects(mask, min_size=64)
+    return mask.astype(bool)
+
 
 def lesion_region(diam, ref, pds, center_idx, pds_thresh=50.0, max_expand=40):
     """
@@ -167,6 +183,89 @@ def skeleton_and_distance(mask):
     diam = 2.0 * dist[skel]
     return skel, dist, coords, diam
 
+def lumen_edges_morph(mask: np.ndarray) -> np.ndarray:
+    """
+    Simple morphological edge of the lumen mask.
+    mask: bool array, True inside lumen.
+    returns: bool array, True at lumen boundary.
+    """
+    m = mask.astype(np.uint8)
+    er = cv2.erode(m, np.ones((3,3), np.uint8))
+    edge = (m & (~er))  # mask minus eroded interior
+    return edge.astype(bool)
+
+
+def unit_normal(P, i, ksize=5):
+    """
+    P: N x 2 array of [y,x] points (ordered centerline)
+    i: index along centerline
+    returns: (t, n) where n is the unit normal [ny, nx]
+    """
+    i0 = max(0, i-ksize)
+    i1 = min(len(P)-1, i+ksize)
+    if i1 == i0:
+        return np.array([0.0,1.0], np.float32), np.array([1.0,0.0], np.float32)
+
+    dy = P[i1,0] - P[i0,0]
+    dx = P[i1,1] - P[i0,1]
+    t = np.array([dy, dx], np.float32)
+    t /= (np.linalg.norm(t) + 1e-6)
+    n = np.array([-t[1], t[0]], np.float32)
+    return t, n
+
+
+def diameters_from_edges(edge_map: np.ndarray,
+                         centerline: np.ndarray,
+                         max_search=30) -> np.ndarray:
+    """
+    Measure lumen diameter along the centerline using edge pixels.
+
+    edge_map: bool array (True at lumen edges)
+    centerline: N x 2 array of [y,x] ints (ordered skeleton)
+    max_search: max pixels to search in each direction along the normal
+    returns: N array of diameters in pixels
+    """
+    h, w = edge_map.shape
+    P = centerline.astype(np.float32)
+    diam = np.zeros(len(P), dtype=np.float32)
+
+    for i in range(len(P)):
+        cy, cx = P[i]
+        _, n = unit_normal(P, i)
+
+        pos_hit = None
+        neg_hit = None
+
+        # positive normal side
+        for s in range(1, max_search+1):
+            py = int(round(cy + n[0]*s))
+            px = int(round(cx + n[1]*s))
+            if py < 0 or py >= h or px < 0 or px >= w:
+                break
+            if edge_map[py, px]:
+                pos_hit = (py, px)
+                break
+
+        # negative normal side
+        for s in range(1, max_search+1):
+            ny = int(round(cy - n[0]*s))
+            nx = int(round(cx - n[1]*s))
+            if ny < 0 or ny >= h or nx < 0 or nx >= w:
+                break
+            if edge_map[ny, nx]:
+                neg_hit = (ny, nx)
+                break
+
+        if pos_hit is not None and neg_hit is not None:
+            y1, x1 = pos_hit
+            y0, x0 = neg_hit
+            diam[i] = np.hypot(y1 - y0, x1 - x0)
+        else:
+            diam[i] = 0.0  # or np.nan if you prefer
+
+    return diam
+
+
 def build_graph_from_skeleton(skel):
     ys, xs = np.nonzero(skel)
     idx = { (y,x): i for i, (y,x) in enumerate(zip(ys, xs)) }
@@ -217,6 +316,31 @@ def rolling_ref(diam, window=80, perc=0.9):
     ref = ref.bfill().ffill().to_numpy()   # <- instead of fillna(method="bfill").fillna(method="ffill")
     return ref
 
+def intensity_profile_along_path(img, yx_ord, smooth_sigma=1.5):
+    """
+    Sample image intensity along the ordered centerline and optionally smooth it.
+    img: float grayscale [0..1]
+    yx_ord: N x 2 array of (row, col) along centerline
+    """
+    ys = np.clip(yx_ord[:, 0].astype(int), 0, img.shape[0]-1)
+    xs = np.clip(yx_ord[:, 1].astype(int), 0, img.shape[1]-1)
+    I = img[ys, xs].astype(np.float32)
+    if smooth_sigma is not None and smooth_sigma > 0:
+        I = gaussian_filter1d(I, sigma=smooth_sigma)
+    return I
+
+
+def intensity_ref_and_drop(I_ord, window=ROLL_WINDOW, perc=0.9):
+    """
+    Build a 'healthy' reference intensity profile and compute % intensity drop.
+    We assume lumen is normally bright; stenosis → darker segment (drop in intensity).
+    """
+    # reference: rolling high percentile, like we did for diameter
+    ref_I = rolling_ref(I_ord, window=window, perc=perc)
+    # percent intensity drop (PID): 0% = no loss, higher = darker vs reference
+    pid = (1.0 - I_ord / (ref_I + 1e-8)) * 100.0
+    return ref_I, pid
+
 
 def measure_stenosis_along_path(coords, diam, path_order):
     yx = coords[path_order, :]
@@ -231,6 +355,25 @@ def measure_stenosis_along_path(coords, diam, path_order):
             if ref[k] >= MIN_REF_DIAM:
                 idx = int(k); break
     return yx, d, ref, pds, int(idx)
+
+def measure_stenosis_on_profile(yx_ord, d_ord):
+    """
+    yx_ord: N x 2 ordered centerline coords
+    d_ord:  N     ordered diameters (e.g., edge-based)
+    returns: (yx_ord, d_ord, ref_ord, pds, min_idx)
+    """
+    ref_ord = rolling_ref(d_ord, window=ROLL_WINDOW, perc=ROLL_PERCENT)
+    pds = (1.0 - (d_ord / (ref_ord + 1e-8))) * 100.0
+
+    lo = EDGE_EXCLUDE
+    hi = len(d_ord) - EDGE_EXCLUDE
+    idx = np.argmin(d_ord[lo:hi]) + lo if hi > lo else np.argmin(d_ord)
+    if ref_ord[idx] < MIN_REF_DIAM:
+        for k in np.argsort(d_ord):
+            if ref_ord[k] >= MIN_REF_DIAM:
+                idx = int(k); break
+    return yx_ord, d_ord, ref_ord, pds, int(idx)
+
 
 def draw_overlay_targeted(base_gray, yx_ord, d_ord, ref_ord, pds, idx_center, idx_prox, idx_dist, out_path):
     """
@@ -291,106 +434,203 @@ def draw_overlay_targeted(base_gray, yx_ord, d_ord, ref_ord, pds, idx_center, id
 
     cv2.imwrite(out_path, rgb)
 
+def draw_overlay_severe(base_gray, yx_ord, d_ord, ref_ord, pds, severe_idxs, out_path):
+    """
+    Draw skeleton + ALL stenosis points with %DS >= threshold (e.g. 80%).
+    Each severe index gets:
+      - red cross
+      - short perpendicular caliper
+      - %DS label
+    """
+
+    base8 = cv2.normalize(base_gray, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    rgb = cv2.cvtColor(base8, cv2.COLOR_GRAY2BGR)
+
+    # Skeleton in white (optional but nice for context)
+    skel = np.zeros_like(base8, dtype=bool)
+    sy, sx = yx_ord[:, 0].astype(int), yx_ord[:, 1].astype(int)
+    skel[sy, sx] = True
+    yy, xx = np.nonzero(skel)
+    rgb[yy, xx] = (255, 255, 255)
+
+    # local tangent/normal helper (same idea as inside draw_overlay_targeted)
+    def unit_normal(P, i, ksize=10):
+        i0 = max(0, i - ksize)
+        i1 = min(len(P) - 1, i + ksize)
+        if i1 == i0:
+            return np.array([0.0, 1.0]), np.array([1.0, 0.0])
+        dy = P[i1, 0] - P[i0, 0]
+        dx = P[i1, 1] - P[i0, 1]
+        t = np.array([dy, dx], np.float32)
+        t /= (np.linalg.norm(t) + 1e-6)
+        n = np.array([-t[1], t[0]], np.float32)
+        return t, n
+
+    P = yx_ord.astype(np.int32)
+
+    for idx in severe_idxs:
+        cy, cx = int(P[idx, 0]), int(P[idx, 1])
+        diam_px = float(d_ord[idx])
+
+        # cross
+        cv2.drawMarker(rgb, (cx, cy), (0, 0, 255),
+                       markerType=cv2.MARKER_CROSS, markerSize=12, thickness=2)
+
+        # short perpendicular caliper
+        _, n = unit_normal(P, idx)
+        v = (n * (diam_px / 2.0)).astype(np.int32)
+        p1 = (int(cx - v[1]), int(cy - v[0]))
+        p2 = (int(cx + v[1]), int(cy + v[0]))
+        cv2.line(rgb, p1, p2, (0, 0, 255), 2)
+
+        # label %DS
+        cv2.putText(rgb, f"{pds[idx]:.0f}%", (cx + 5, cy - 5),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 1, cv2.LINE_AA)
+
+    cv2.imwrite(out_path, rgb)
 
 
 def run_one_image(input_path, out_prefix, px=None,
                   pds_thresh=50.0, topk=3, suppression=20,
-                  mark_deepest=False, mark_index=None, debug_plot=False):
+                  mark_deepest=False, mark_index=None, debug_plot=False, mask_mode=False):
+
+    # 0) Load base grayscale (used for overlay background)
     img = img_as_float(io.imread(input_path, as_gray=True))
-    fov_mask = build_fov_mask(img, right_strip_px=110, bottom_strip_px=15)
+    # --- Save the intensity image we use for intensity profiling ---
+    intensity8 = cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    cv2.imwrite(f"{out_prefix}_intensity.png", intensity8)
 
-    lumen_mask, vesselness = segment_lumen_isolated_fixed(
-        img, fov_mask, min_obj=200, close_r=3, open_r=1, ridge_dilate=3
-    )
+    # --- Save pseudocolor intensity heatmap ---
+    heat = cv2.applyColorMap(intensity8, cv2.COLORMAP_JET)
+    alpha = 0.45   # transparency
+    overlay_heat = cv2.addWeighted(heat, alpha, cv2.cvtColor(intensity8, cv2.COLOR_GRAY2BGR), 1-alpha, 0)
+    cv2.imwrite(f"{out_prefix}_intensity_heatmap.png", overlay_heat)
 
-    skel, dist, coords, diam = skeleton_and_distance(lumen_mask)
-    
-    cv2.imwrite(f"{out_prefix}_vesselness.png", (vesselness*255).astype(np.uint8))
-    cv2.imwrite(f"{out_prefix}_mask.png", (lumen_mask.astype(np.uint8))*255)
 
-    # skeleton overlay for sanity-check
-    cv2.imwrite(f"{out_prefix}_vesselness.png", (vesselness*255).astype(np.uint8))
-    cv2.imwrite(f"{out_prefix}_mask.png", (lumen_mask.astype(np.uint8))*255)
+    # 1) Get lumen mask (either from file in --mask_mode or via segmentation)
+    if mask_mode:
+        lumen_mask = load_binary_mask(input_path)
+        vesselness = None
+    else:
+        fov_mask = build_fov_mask(img, right_strip_px=110, bottom_strip_px=15)
+        lumen_mask, vesselness = segment_lumen_isolated_fixed(
+            img, fov_mask, min_obj=200, close_r=3, open_r=1, ridge_dilate=3
+        )
+
+    # 2) Skeleton + distance map (still useful for QC, but we won't use diam_dt)
+    skel, dist, coords, diam_dt = skeleton_and_distance(lumen_mask)
+
+    # 3) Save intermediates (unchanged)
+    if vesselness is not None:
+        cv2.imwrite(f"{out_prefix}_vesselness.png", (vesselness * 255).astype(np.uint8))
+    cv2.imwrite(f"{out_prefix}_mask.png", (lumen_mask.astype(np.uint8)) * 255)
+
     base8 = cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
     rgb = cv2.cvtColor(base8, cv2.COLOR_GRAY2BGR)
-    ys, xs = np.nonzero(skel); rgb[ys,xs] = (255,255,255)
+    ys, xs = np.nonzero(skel)
+    rgb[ys, xs] = (255, 255, 255)
     cv2.imwrite(f"{out_prefix}_skeleton.png", rgb)
 
+    # 4) Order centerline along main path
     G = build_graph_from_skeleton(skel)
     path, H = longest_path_on_lcc(G)
     if not path:
         raise RuntimeError("Empty skeleton graph.")
 
-    yx_to_idx = { (r,c): k for k,(r,c) in enumerate(map(tuple, coords)) }
-    path_idx = np.array([yx_to_idx[(H.nodes[n]['y'], H.nodes[n]['x'])] for n in path])
+    yx_to_idx = { (r, c): k for k, (r, c) in enumerate(map(tuple, coords)) }
+    path_idx = np.array([ yx_to_idx[(H.nodes[n]['y'], H.nodes[n]['x'])] for n in path ])
 
-    yx_ord, d_ord, ref_ord, pds, min_idx = measure_stenosis_along_path(coords, diam, path_idx)
+    # ordered centerline coords
+    yx_ord = coords[path_idx]
 
+    # 4b) Edge map from lumen mask
+    edges = lumen_edges_morph(lumen_mask)
+
+    # 4c) Diameters from edges along the skeleton
+    d_ord = diameters_from_edges(edges, yx_ord, max_search=30)
+
+    # 5) Diameter profile, rolling reference, %DS using ordered profile
+    yx_ord, d_ord, ref_ord, pds, _ = measure_stenosis_on_profile(yx_ord, d_ord)
+
+    # 5b) Intensity profile along the same centerline + percent intensity drop
+    I_ord = intensity_profile_along_path(img, yx_ord, smooth_sigma=1.5)
+    I_ref, pid = intensity_ref_and_drop(I_ord, window=ROLL_WINDOW, perc=ROLL_PERCENT)
+
+    # --- Save intensity profile plot ---
     if debug_plot:
         try:
-            import matplotlib.pyplot as plt
             plt.figure(figsize=(8,3))
-            plt.plot(d_ord, label="Diameter (px)")
-            plt.plot(ref_ord, linestyle="--", label="Ref (P90)")
-            plt.title(f"Diameter profile: {os.path.basename(input_path)}")
+            plt.plot(I_ord, label="Intensity")
+            plt.plot(I_ref, "--", label="Ref Intensity (P90)")
+            plt.plot(pid, label="% Intensity Drop")
+            plt.title(f"Intensity profile: {os.path.basename(input_path)}")
             plt.xlabel("Centerline index")
-            plt.ylabel("Diameter (px)")
+            plt.ylabel("Intensity / %Drop")
             plt.legend()
             plt.tight_layout()
-            plot_path = f"{out_prefix}_diam_profile.png"
-            plt.savefig(plot_path, dpi=160)
+            plt.savefig(f"{out_prefix}_intensity_profile.png", dpi=160)
             plt.close()
-            print(f"[plot] saved {plot_path}")
         except Exception as e:
-            print(f"[WARN] plot failed for {input_path}: {e}")
+            print(f"[WARN] intensity plot failed: {e}")
 
+    
+    # 6b) All severe indices (e.g. %DS >= 80)
+    severe_idxs = np.where(pds >= 80.0)[0]
 
-    # ---- NEW: choose which indices to mark on the overlay ----
-    if mark_index is not None:     # force a specific plot index
-        idxs = [int(np.clip(mark_index, 0, len(d_ord)-1))]
-    elif mark_deepest:             # force the global minimum diameter
+        # 7) Choose index(es) to mark
+    if mark_index is not None:
+        idxs = [int(np.clip(mark_index, 0, len(d_ord) - 1))]
+    elif mark_deepest:
         idxs = [int(np.argmin(d_ord))]
     else:
-        # default automatic detection (V-shape / sudden drop logic you added)
-        idxs = pick_stenoses(d_ord, pds, rel_drop=0.30, abs_drop=1.5, window=12)
+        # geometry + intensity combined
+        idxs = pick_stenoses_geo_int(
+            d_ord, pds, pid,
+            rel_drop=0.30,   # 30% relative diameter drop
+            abs_drop=1.5,    # or >= 1.5 px absolute drop
+            int_drop=15.0,   # and ~15% intensity drop
+            window=12
+        )
         if len(idxs) == 0 and len(d_ord) > 0:
             idxs = [int(np.argmin(d_ord))]
-        center_idx = int(idxs[0])
 
-    # expand to lesion edges using %DS threshold
-    i0, i1 = lesion_region(d_ord, ref_ord, pds, center_idx, pds_thresh=50.0, max_expand=40)
-    # ----------------------------------------------------------
+    # pick a primary center index
+    center_idx = int(idxs[0]) if len(idxs) else 0
 
-    # draw targeted overlay
-    if pds[center_idx] < 20:
-        print(f"[skip] {os.path.basename(input_path)}: %DS={pds[center_idx]:.1f} < 20; not drawing.")
+    # 8) Lesion extent & overlay
+    i0, i1 = lesion_region(d_ord, ref_ord, pds, center_idx,
+                           pds_thresh=float(pds_thresh), max_expand=40)
+
+
+    overlay_path = f"{out_prefix}_overlay.png"
+    overlay_made = False
+
+    if len(severe_idxs) > 0:
+        # NEW: draw ALL indices with %DS >= 80%
+        draw_overlay_severe(img, yx_ord, d_ord, ref_ord, pds, severe_idxs, overlay_path)
+        overlay_made = True
+    elif len(d_ord) > 0 and pds[center_idx] >= 20:
+        # fallback: old single-target overlay
+        draw_overlay_targeted(img, yx_ord, d_ord, ref_ord, pds,
+                              center_idx, i0, i1, overlay_path)
+        overlay_made = True
     else:
-        overlay_path = f"{out_prefix}_overlay.png"
-        draw_overlay_targeted(img, yx_ord, d_ord, ref_ord, pds, center_idx, i0, i1, overlay_path)
-    # ---- NEW: add curve index column so plot ↔ pixels is explicit ----
+        print(f"[skip] {os.path.basename(input_path)}: %DS={pds[center_idx]:.1f} < 20; not drawing.")
+
+
+    # 9) Build CSVs
     curve_idx = np.arange(len(d_ord))
-    # ----------------------------------------------------------
-
-    # Build detections list for overlay/CSV (keep as-is, just include idx if you like)
-    detections = [{
-        "idx": int(i),                      # curve index on the plot (optional but handy)
-        "r": int(yx_ord[i,0]),
-        "c": int(yx_ord[i,1]),
-        "diam_px": float(d_ord[i]),
-        "ref_px": float(ref_ord[i]),
-        "pds": float(pds[i])
-    } for i in idxs]
-
-    # Per-image CSV (add curve_idx column)
     df = pd.DataFrame({
-        "curve_idx": curve_idx,           # <— NEW
+        "curve_idx": curve_idx,
         "y": yx_ord[:, 0],
         "x": yx_ord[:, 1],
         "diameter_px": d_ord,
         "ref_diameter_px": ref_ord,
-        "percent_diameter_stenosis": pds
+        "percent_diameter_stenosis": pds,
+        "intensity": I_ord,
+        "ref_intensity": I_ref,
+        "percent_intensity_drop": pid
     })
-
     if px is not None:
         df["diameter_mm"] = df["diameter_px"] * px
         df["ref_diameter_mm"] = df["ref_diameter_px"] * px
@@ -399,18 +639,40 @@ def run_one_image(input_path, out_prefix, px=None,
     os.makedirs(os.path.dirname(csv_path) or ".", exist_ok=True)
     df.to_csv(csv_path, index=False)
 
-    # detections CSV + overlay
+    detections = [{
+        "idx": int(i),
+        "r": int(yx_ord[i, 0]),
+        "c": int(yx_ord[i, 1]),
+        "diam_px": float(d_ord[i]),
+        "ref_px": float(ref_ord[i]),
+        "pds": float(pds[i])
+    } for i in idxs]
     det_csv = f"{out_prefix}_detections.csv"
     pd.DataFrame(detections).to_csv(det_csv, index=False)
 
-    overlay_path = f"{out_prefix}_overlay.png"
-    draw_overlay_targeted(img, yx_ord, d_ord, ref_ord, pds, center_idx, i0, i1, overlay_path)
+        # --- Count %DS ranges (ignore curve edges to avoid border artifacts) ---
+    curve_idx = np.arange(len(d_ord))
+    valid_mask = (curve_idx >= EDGE_EXCLUDE) & (curve_idx < len(d_ord) - EDGE_EXCLUDE)
+
+    if len(d_ord) > 0 and np.any(valid_mask):
+        pds_valid = pds[valid_mask]
+        mask_80_90 = (pds_valid >= 80.0) & (pds_valid < 90.0)
+        mask_ge90  = (pds_valid >= 90.0)
+
+        num_80_90 = int(np.count_nonzero(mask_80_90))
+        num_ge90  = int(np.count_nonzero(mask_ge90))
+        max_pds_valid = float(np.max(pds_valid))
+    else:
+        num_80_90 = 0
+        num_ge90  = 0
+        max_pds_valid = float("nan")
 
 
+    # 10) Summary dict
     first = detections[0] if detections else {}
     summary = {
         "image": input_path,
-        "overlay_path": overlay_path,
+        "overlay_path": overlay_path if overlay_made else "",
         "per_image_csv": csv_path,
         "detections_csv": det_csv if detections else "",
         "num_detections": len(detections),
@@ -418,14 +680,48 @@ def run_one_image(input_path, out_prefix, px=None,
         "first_y": int(first.get("r", -1)),
         "first_diam_px": float(first.get("diam_px", np.nan)),
         "first_ref_px": float(first.get("ref_px", np.nan)),
-        "first_%DS": float(first.get("pds", np.nan))
+        "first_%DS": float(first.get("pds", np.nan)),
+
+        # NEW:
+        "num_points_80_90": num_80_90,
+        "num_points_ge90": num_ge90,
+        "max_%DS_valid": max_pds_valid
     }
+
     if px is not None and detections:
         summary.update({
             "first_diam_mm": float(first["diam_px"]) * px,
             "first_ref_mm": float(first["ref_px"]) * px
         })
     return summary
+
+def pick_stenoses_geo_int(diam, pds, pid,
+                          rel_drop=0.4, abs_drop=2.0, int_drop=15.0, window=15):
+    """
+    Combine geometry (diameter) + intensity.
+    - First use your existing geometric logic (`pick_stenoses`)
+    - Then keep only those where the percent intensity drop (PID) is large enough.
+
+    diam: diameter profile (px)
+    pds:  % diameter stenosis profile
+    pid:  % intensity drop profile (0..100)
+    int_drop: minimum % intensity drop to accept as strong stenosis
+    """
+    # 1) start from geometric candidates (your existing logic)
+    base_cands = pick_stenoses(diam, pds, rel_drop=rel_drop,
+                               abs_drop=abs_drop, window=window)
+
+    base_cands = list(base_cands)
+    if not base_cands:
+        return []
+
+    pid = np.asarray(pid)
+    # 2) filter by intensity drop
+    strong = [i for i in base_cands if pid[i] >= int_drop]
+
+    # 3) if nothing passes intensity filter, fall back to geometric picks
+    return strong if strong else base_cands
+
 
 def pick_stenoses(diam, pds, rel_drop=0.4, abs_drop=2.0, window=15):
     """
@@ -509,6 +805,9 @@ def parse_args():
                 help="Force marking a specific centerline index from the diameter plot")
     ap.add_argument("--debug_plot", action="store_true",
                 help="Save a diameter profile plot per image (requires matplotlib)")
+    ap.add_argument("--mask_mode", action="store_true",
+    help="Input is already a binarized vessel mask (white lumen on black). Skip segmentation.")
+
 
     return ap.parse_args()
 
@@ -526,7 +825,8 @@ def main():
             out_prefix = out
         res = run_one_image(inp, out_prefix, px=px,
         pds_thresh=args.pds_thresh, topk=args.topk, suppression=args.suppression,
-        mark_deepest=args.mark_deepest, mark_index=args.mark_index, debug_plot=args.debug_plot)
+        mark_deepest=args.mark_deepest, mark_index=args.mark_index,
+        debug_plot=args.debug_plot, mask_mode=args.mask_mode)
 
         print(pd.Series(res).to_string())
         return
@@ -561,7 +861,7 @@ def main():
                 pref = os.path.join(out, safe_stem(im))
                 summaries.append(run_one_image(im, pref, px,
                 args.pds_thresh, args.topk, args.suppression,
-                args.mark_deepest, args.mark_index, args.debug_plot))
+                args.mark_deepest, args.mark_index, args.debug_plot, args.mask_mode))
                 print(f"[OK] {im}")
             except Exception as e:
                 errors.append((im, str(e)))
@@ -574,6 +874,14 @@ def main():
         print(f"\nSaved master summary: {os.path.join(out, 'summary.csv')}")
         if px is not None:
             print("Units: diameters also reported in mm using --px.")
+                # Extra: only images with at least one point in [80, 90)% DS
+        if "num_points_80_90" in df.columns:
+            df_80_90 = df[df["num_points_80_90"] > 0].copy()
+            if not df_80_90.empty:
+                path_80_90 = os.path.join(out, "summary_80_90.csv")
+                df_80_90.to_csv(path_80_90, index=False)
+                print(f"Saved 80–90% DS summary: {path_80_90}")
+
     if errors:
         print("\nSome images failed:", file=sys.stderr)
         for im, msg in errors:

@@ -1,0 +1,3 @@
+image,overlay_path,per_image_csv,detections_csv,num_detections,first_x,first_y,first_diam_px,first_ref_px,first_%DS,num_points_80_90,num_points_ge90,max_%DS_valid,first_diam_mm,first_ref_mm
+D:\Work\CV\Project\Data\14.png,D:\Work\CV\Project\Out_all\14_overlay.png,D:\Work\CV\Project\Out_all\14.csv,D:\Work\CV\Project\Out_all\14_detections.csv,13,159,212,0.0,15.231546401977539,100.0,10,4,100.0,0.0,3.3509402084350586
+D:\Work\CV\Project\Data\11.png,D:\Work\CV\Project\Out_all\11_overlay.png,D:\Work\CV\Project\Out_all\11.csv,D:\Work\CV\Project\Out_all\11_detections.csv,8,25,154,5.385164737701416,9.0,40.16483631424557,6,54,100.0,1.1847362422943115,1.98

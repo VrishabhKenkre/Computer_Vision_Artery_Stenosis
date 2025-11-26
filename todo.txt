@@ -22,3 +22,13 @@ python stenosis_centerline_batch.py --in "D:\Work\CV\Project\Data\14.png"
 
 python stenosis_centerline_batch.py --in "D:\Work\CV\Project\Data\14.png" --out "D:\Work\CV\Project\Out\14" --px 0.22 --debug_plot
 python stenosis_centerline_batch.py --in "D:\Work\CV\Project\Data\11.png" --out "D:\Work\CV\Project\Out\11" --px 0.22 --debug_plot
+
+#For Images I will be getting from Shweta
+python stenosis_centerline_batch.py 
+  --in "D:\Work\CV\Project\Data\15.png" 
+  --out "D:\Work\CV\Project\Out\15" 
+  --px 0.22 
+  --mask_mode 
+  --debug_plot
+
+

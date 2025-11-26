@@ -1,0 +1,13 @@
+cd D:\Work\CV\Project
+
+python stenosis_from_mask.py 
+  --in "D:\Work\CV\Project\Data\15.png" 
+  --out "D:\Work\CV\Project\Out\15_mask" 
+  --px 0.22
+
+todo_3 - for detect_blobs
+python detect_blobs_from_mask.py
+  --in "D:\Work\CV\Project\Data\15.png" 
+  --out "D:\Work\CV\Project\Out\15_blob" 
+  --px 0.22
+
