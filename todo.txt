@@ -2,7 +2,7 @@
 python stenosis_centerline_batch.py --in /path/to/frame.png --out out/case1 --px 0.22
 
 # Whole folder (recursive) with 6 workers -> Rsults in Summary.csv
-ppython stenosis_centerline_batch.py 
+python stenosis_centerline_batch.py 
     --in "D:\Work\CV\Project\Data" 
     --out "D:\Work\CV\Project\Out_all" 
     --px 0.22 
