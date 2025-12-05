@@ -1,3 +1,4 @@
+# Diameter Stenosis part from Sangram Sahoo
 # stenosis_centerline_batch.py
 # Coronary vessel centerline + diameter + %DS on a single image or a whole folder.
 
@@ -6,6 +7,9 @@ import sys
 import argparse
 import glob
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from blockage_pipeline import blockage_pipeline
+from gamma_blackhat import gamma_blackhat_binarize_bgr
+
 
 import cv2
 import numpy as np
@@ -537,48 +541,67 @@ def pick_stenoses_geo_int(diam, pds, pid,
 # Per-image pipeline
 # ---------------------------
 
-def run_one_image(input_path,
-                  out_prefix,
-                  px=None,
-                  pds_thresh=50.0,
-                  topk=3,
-                  suppression=20,
-                  mark_deepest=False,
-                  mark_index=None,
-                  debug_plot=False,
-                  mask_mode=False):
+def run_one_image(input_path, out_prefix, px=None,
+                  pds_thresh=50.0, topk=3, suppression=20,
+                  mark_deepest=False, mark_index=None,
+                  debug_plot=False, mask_mode=False,
+                  use_gamma_seg=False,
+                  gamma_val=1.0, gamma_kernel=31, gamma_thresh=100):
 
-    # 0) Load base grayscale
+    # 0) Load base grayscale (used for overlay background)
     img = img_as_float(io.imread(input_path, as_gray=True))
 
-    # Intensity image & heatmap
-    intensity8 = cv2.normalize(img, None, 0, 255,
-                               cv2.NORM_MINMAX).astype(np.uint8)
+    intensity8 = cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
     cv2.imwrite(f"{out_prefix}_intensity.png", intensity8)
 
     heat = cv2.applyColorMap(intensity8, cv2.COLORMAP_JET)
     alpha = 0.45
     overlay_heat = cv2.addWeighted(
         heat, alpha,
-        cv2.cvtColor(intensity8, cv2.COLOR_GRAY2BGR), 1 - alpha,
-        0
+        cv2.cvtColor(intensity8, cv2.COLOR_GRAY2BGR), 1 - alpha, 0
     )
     cv2.imwrite(f"{out_prefix}_intensity_heatmap.png", overlay_heat)
 
-    # 1) Lumen mask
+    # 🔹 Run teammate's blockage detector on *this* image
+    try:
+        run_rajiv_blockage(input_path, out_prefix)
+    except Exception as e:
+        print(f"[WARN] teammate blockage_pipeline failed on {input_path}: {e}")
+
+
+    # 1) Get lumen mask:
+    #    a) --mask_mode: use external binary mask file
+    #    b) --use_gamma_seg: gamma+blackhat+threshold binarization
+    #    c) else: our default Frangi + black-hat segmentation
     if mask_mode:
         lumen_mask = load_binary_mask(input_path)
         vesselness = None
+
+    elif use_gamma_seg:
+        #  gamma + black-hat + threshold
+        bgr = cv2.imread(input_path, cv2.IMREAD_COLOR)
+        if bgr is None:
+            raise RuntimeError(f"Cannot read image for gamma seg: {input_path}")
+
+        bin_img = gamma_blackhat_binarize_bgr(
+            bgr,
+            gamma=gamma_val,
+            kernel_size=gamma_kernel,
+            thresh=gamma_thresh
+        )
+
+        #Shweta's code returns bright = vessel; we want a boolean mask
+        lumen_mask = bin_img > 0
+
+        # no 'vesselness' map here
+        vesselness = None
+
     else:
-        fov_mask = build_fov_mask(img,
-                                  right_strip_px=110,
-                                  bottom_strip_px=15)
+        # default: our Frangi + black-hat pipeline
+        fov_mask = build_fov_mask(img, right_strip_px=110, bottom_strip_px=15)
         lumen_mask, vesselness = segment_lumen_isolated_fixed(
             img, fov_mask,
-            min_obj=200,
-            close_r=3,
-            open_r=1,
-            ridge_dilate=3
+            min_obj=200, close_r=3, open_r=1, ridge_dilate=3
         )
 
     # 2) Skeleton + distance (DT diameters are QC only now)
@@ -620,6 +643,7 @@ def run_one_image(input_path,
     # 5) Diameter profile, reference, %DS
     yx_ord, d_ord, ref_ord, pds, _ = measure_stenosis_on_profile(yx_ord,
                                                                  d_ord)
+    center_idx = 0
 
     # 5a) Diameter debug plot
     if debug_plot:
@@ -661,25 +685,54 @@ def run_one_image(input_path,
             print(f"[WARN] intensity plot failed: {e}")
 
     # 6) Severe indices (%DS >= 80)
+    # 6b) we still keep severe_idxs for statistics, but we don't use it for drawing
     severe_idxs = np.where(pds >= 80.0)[0]
 
-    # 7) Choose index(es) to mark
-    if mark_index is not None:
-        idxs = [int(np.clip(mark_index, 0, len(d_ord) - 1))]
-    elif mark_deepest:
-        idxs = [int(np.argmin(d_ord))]
-    else:
-        idxs = pick_stenoses_geo_int(
-            d_ord, pds, pid,
-            rel_drop=0.30,
-            abs_drop=1.5,
-            int_drop=15.0,
-            window=12
-        )
-        if len(idxs) == 0 and len(d_ord) > 0:
-            idxs = [int(np.argmin(d_ord))]
+    overlay_path = f"{out_prefix}_overlay.png"
+    overlay_made = False
 
-    center_idx = int(idxs[0]) if len(idxs) else 0
+    if len(d_ord) == 0 or len(pds) == 0:
+        print(f"[skip] {os.path.basename(input_path)}: empty diameter profile; no overlay.")
+    elif pds[center_idx] < 20:
+        print(f"[skip] {os.path.basename(input_path)}: %DS={pds[center_idx]:.1f} < 20; not drawing.")
+    else:
+        # find lesion extent around chosen index
+        i0, i1 = lesion_region(
+            d_ord, ref_ord, pds,
+            center_idx,
+            pds_thresh=float(pds_thresh),
+            max_expand=40
+        )
+        # draw your clean overlay (cross + caliper)
+        draw_overlay_targeted(
+            img, yx_ord, d_ord, ref_ord, pds,
+            center_idx, i0, i1, overlay_path
+        )
+        overlay_made = True
+
+    # 7) Choose index(es) to mark
+    if len(d_ord) == 0:
+        idxs = []
+        center_idx = 0
+    else:
+        if mark_index is not None:
+            idxs = [int(np.clip(mark_index, 0, len(d_ord) - 1))]
+        elif mark_deepest:
+            idxs = [int(np.argmin(d_ord))]
+        else:
+            # geometry + intensity combined
+            idxs = pick_stenoses_geo_int(
+                d_ord, pds, pid,
+                rel_drop=0.30,   # 30% relative diameter drop
+                abs_drop=1.5,    # or >= 1.5 px absolute drop
+                int_drop=15.0,   # and ~15% intensity drop
+                window=12
+            )
+            if len(idxs) == 0:
+                idxs = [int(np.argmin(d_ord))]
+
+        center_idx = int(np.clip(idxs[0], 0, len(d_ord) - 1))
+
 
     # 8) Lesion extent & overlay
     i0, i1 = lesion_region(d_ord, ref_ord, pds, center_idx,
@@ -809,6 +862,14 @@ def safe_stem(path):
     s = os.path.splitext(os.path.basename(path))[0]
     return "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in s)
 
+def run_rajiv_blockage(image_path: str, out_prefix: str):
+    """
+    image_path : full path to the input (e.g. D:\\Work\\CV\\Project\\Data\\14.png)
+    out_prefix: output prefix; we only use its folder as save_folder.
+    """
+    save_folder = os.path.dirname(out_prefix) or "."
+    blockage_pipeline(image_path, save_folder)
+
 
 # ---------------------------
 # CLI
@@ -845,6 +906,15 @@ def parse_args():
     ap.add_argument("--mask_mode", action="store_true",
                     help="Input is already a binarized vessel mask."
                          " Skip segmentation.")
+    ap.add_argument("--use_gamma_seg", action="store_true",
+                    help="gamma+blackhat+threshold binarization for lumen mask")
+    ap.add_argument("--gamma_val", type=float, default=1.0,
+                    help="Gamma for binarization (default 1.0)")
+    ap.add_argument("--gamma_kernel", type=int, default=31,
+                    help="Black-hat kernel size for binarization (default 31)")
+    ap.add_argument("--gamma_thresh", type=int, default=100,
+                    help="Threshold for binarization (0–255, default 100)")
+    
     return ap.parse_args()
 
 
@@ -869,7 +939,11 @@ def main():
             mark_deepest=args.mark_deepest,
             mark_index=args.mark_index,
             debug_plot=args.debug_plot,
-            mask_mode=args.mask_mode
+            mask_mode=args.mask_mode,
+            use_gamma_seg=args.use_gamma_seg,
+            gamma_val=args.gamma_val,
+            gamma_kernel=args.gamma_kernel,
+            gamma_thresh=args.gamma_thresh,
         )
         print(pd.Series(res).to_string())
         return
@@ -922,7 +996,9 @@ def main():
                         args.mark_deepest,
                         args.mark_index,
                         args.debug_plot,
-                        args.mask_mode
+                        args.mask_mode,
+                        args.use_gamma_seg, args.gamma_val,
+                        args.gamma_kernel, args.gamma_thresh
                     )
                 )
                 print(f"[OK] {im}")
